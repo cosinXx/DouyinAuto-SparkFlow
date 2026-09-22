@@ -9,9 +9,21 @@ PLAYWRIGHT_BROWSERS_PATH = "../chrome"
 def install_browser():
     """
     安装 Chromium 浏览器
+    使用当前 Python 环境自带的 playwright 模块安装（不依赖系统 PATH 里的 playwright 命令，
+    避免环境残留的坏脚本导致安装失败）。
     """
+    env = os.environ.copy()
+    # 与 get_browser 保持一致：安装到项目 chrome/ 目录
+    browsers_path = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), PLAYWRIGHT_BROWSERS_PATH)
+    )
+    env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
     try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            env=env,
+        )
         print("浏览器安装完成，请重新运行程序。")
     except subprocess.CalledProcessError as e:
         print(f"发生未知错误：{e}")
