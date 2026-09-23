@@ -86,6 +86,7 @@ _run = {
     "started": None,
     "exitcode": None,
     "mode": "normal",  # normal | dryrun
+    "auto_restart_pending": False,  # 任务完成后是否待自动重启
 }
 _run_lock = threading.Lock()
 
@@ -690,6 +691,7 @@ def start_run(dryrun=False):
         _run["started"] = time.time()
         _run["exitcode"] = None
         _run["mode"] = "dryrun" if dryrun else "normal"
+        _run["auto_restart_pending"] = False  # 新任务取消待重启
         try:
             env = os.environ.copy()
             if dryrun:
@@ -730,6 +732,11 @@ def start_run(dryrun=False):
                     # [修复] 不覆盖手动停止状态：stop_run() 已将 state 设为 "stopped"
                     if _run["state"] != "stopped":
                         _run["state"] = "done" if proc.returncode == 0 else "error"
+                    # 任务完成后 10 秒自动重启后端（手动停止不触发）
+                    if _run["state"] in ("done", "error"):
+                        _run["auto_restart_pending"] = True
+                        _run["lines"].append("\n[任务完成，10 秒后自动重启后端…]\n")
+                        threading.Thread(target=_schedule_auto_restart, daemon=True).start()
 
         threading.Thread(target=_reader, daemon=True).start()
         return {"ok": True, "msg": "测试运行已启动" if dryrun else "任务已启动"}
@@ -769,10 +776,40 @@ def stop_run():
         with _run_lock:
             _run["state"] = "stopped"
             _run["exitcode"] = proc.returncode
+            _run["auto_restart_pending"] = False  # 手动停止取消自动重启
             _run["lines"].append("\n[已手动停止任务]\n")
         return {"ok": True, "msg": "任务已停止"}
     except Exception as e:
         return {"ok": False, "msg": f"停止失败: {e}"}
+
+
+def _schedule_auto_restart():
+    """任务完成后延迟 10 秒自动重启后端进程（os.execv 原地替换）。"""
+    import time
+    time.sleep(10)
+    with _run_lock:
+        # 再次检查：用户可能在 10 秒内手动停止或发起新任务
+        if not _run["auto_restart_pending"]:
+            return
+        if _run["state"] == "running":
+            return  # 用户发起了新任务，不重启
+        _run["auto_restart_pending"] = False
+        _run["lines"].append("\n[正在自动重启后端…]\n")
+    # 终止可能残留的任务子进程（与 /api/restart 同逻辑）
+    with _run_lock:
+        proc = _run["proc"]
+        if proc is not None and proc.poll() is None:
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def run_status():
