@@ -5,17 +5,26 @@ DouYinSparkFlow Web 控制台后端 v2
 零依赖（仅 Python 标准库），用项目自带 .venv 的 Python 运行即可。
 启动：.venv/bin/python webui/server.py
 """
+import contextlib
 import json
 import os
 import plistlib
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# fcntl 仅 POSIX 提供；Windows 上没有，降级为仅线程锁（单机本地控制台，可接受）
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
 
 # ---------- 路径 ----------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,6 +69,12 @@ AI_FEATURES = {
 }
 MAX_RUN_LINES = 50000  # 运行输出在内存中的最大行数（防长任务内存膨胀）
 
+# 抖音号 / .env COOKIES_ 键的白名单：字母数字._-，最长 64（防键注入与路径穿越）
+UID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# 允许的 Host（本地控制台只接受本机回环）
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+ALLOWED_ORIGIN_HOSTS = {"127.0.0.1", "localhost"}
+
 HITOKOTO_TYPES = ["动画", "漫画", "游戏", "文学", "原创", "来自网络", "其他",
                   "影视", "诗词", "哲学", "抖机灵"]
 
@@ -76,6 +91,36 @@ _run_lock = threading.Lock()
 
 # ---------- .env 文件锁（防止并发写入丢数据） ----------
 _env_lock = threading.Lock()
+ENV_LOCK_PATH = ENV_PATH + ".lock"
+
+
+@contextlib.contextmanager
+def _env_file_lock():
+    """跨进程排他文件锁（POSIX flock）。
+    server 与 main.py/tasks.py 子进程可能并发写 .env，仅线程锁挡不住跨进程竞争；
+    Windows 无 fcntl，降级为仅线程锁。"""
+    if fcntl is None:
+        yield
+        return
+    lock_f = None
+    locked = False
+    try:
+        try:
+            lock_f = open(ENV_LOCK_PATH, "a+", encoding="utf-8")
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except OSError:
+            # 锁文件异常时不阻塞主流程（仍有线程锁兜底）
+            pass
+        yield
+    finally:
+        if lock_f is not None:
+            if locked:
+                try:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            lock_f.close()
 
 # ---------- 火花监控进度（异步任务状态） ----------
 _spark_monitor_progress = {
@@ -101,17 +146,26 @@ def read_env_lines():
 
 
 def _write_env_lines_atomic(lines):
-    """原子写入 .env：先写临时文件再 rename，避免写入中途崩溃导致文件损坏。"""
-    tmp_path = ENV_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, ENV_PATH)
+    """原子写入 .env：先写临时文件再 rename，避免写入中途崩溃导致文件损坏。
+    临时文件名带 pid/tid，避免多进程/多线程同时写同一个 .tmp 互相覆盖。"""
+    tmp_path = ENV_PATH + f".tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, ENV_PATH)
+    finally:
+        # 异常路径下清理残留临时文件
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def write_env_lines(lines):
-    with _env_lock:
+    with _env_lock, _env_file_lock():
         _write_env_lines_atomic(lines)
 
 
@@ -144,9 +198,9 @@ def set_env_value(key, value, quote=None):
     """
     行级替换/追加某个 KEY 的值。
     quote: None 原样写；"'" 单引号包裹；'"' 双引号包裹。
-    使用原子写入，保证并发安全。
+    使用原子写入 + 线程锁 + 跨进程文件锁，保证并发安全。
     """
-    with _env_lock:
+    with _env_lock, _env_file_lock():
         lines = []
         try:
             with open(ENV_PATH, encoding="utf-8") as f:
@@ -154,39 +208,44 @@ def set_env_value(key, value, quote=None):
         except FileNotFoundError:
             lines = []
 
+        # 撇号保护：值本身含单引号时再用单引号包裹会提前闭合、破坏 .env。
+        # dotenv 对裸值原样保留到行尾（JSON 不含单引号，回退裸写安全）。
+        use_quote = quote
+        if use_quote == "'" and "'" in value:
+            use_quote = None
+
+        def _render():
+            if use_quote == "'":
+                return f"{key}='{value}'"
+            if use_quote == '"':
+                return f'{key}="{value}"'
+            return f"{key}={value}"
+
         new_lines = []
         found = False
         for line in lines:
             if re.match(rf"^\s*{re.escape(key)}\s*=", line):
-                if quote == "'":
-                    new_lines.append(f"{key}='{value}'")
-                elif quote == '"':
-                    new_lines.append(f'{key}="{value}"')
-                else:
-                    new_lines.append(f"{key}={value}")
+                new_lines.append(_render())
                 found = True
             else:
                 new_lines.append(line)
         if not found:
-            if quote == "'":
-                new_lines.append(f"{key}='{value}'")
-            elif quote == '"':
-                new_lines.append(f'{key}="{value}"')
-            else:
-                new_lines.append(f"{key}={value}")
+            new_lines.append(_render())
         _write_env_lines_atomic(new_lines)
+    os.environ[key] = value  # 同步运行时环境，确保子进程拿到最新值
 
 
 def del_env_value(key):
     """从 .env 删除某个 KEY（原子写入）。删除不存在的键是幂等操作。"""
-    with _env_lock:
+    with _env_lock, _env_file_lock():
         try:
             with open(ENV_PATH, encoding="utf-8") as f:
                 lines = f.read().splitlines()
         except FileNotFoundError:
-            return
+            lines = []
         new_lines = [line for line in lines if not re.match(rf"^\s*{re.escape(key)}\s*=", line)]
         _write_env_lines_atomic(new_lines)
+    os.environ.pop(key, None)  # 同步删除运行时环境变量
 
 
 def _safe_json_loads(raw, default):
@@ -198,13 +257,13 @@ def _safe_json_loads(raw, default):
 
 
 def read_tasks():
-    """读取并解析 TASKS，返回 list。"""
+    """读取并解析 TASKS，返回 list（脏数据防御：非对象元素一律过滤）。"""
     env = parse_env()
     raw = env.get("TASKS", "[]")
     tasks = _safe_json_loads(raw, [])
     if not isinstance(tasks, list):
         return []
-    return tasks
+    return [t for t in tasks if isinstance(t, dict)]
 
 
 def write_tasks(tasks):
@@ -279,6 +338,55 @@ def count_cookies(raw_json):
     except Exception:
         pass
     return 0
+
+
+# ---- 从 Cookies 识别当前登录的抖音账号（昵称/抖音号/短ID） ----
+_profile_cache = {}  # key: COOKIES_UID -> (ts, profile_dict)
+_PROFILE_TTL = 600
+
+
+def fetch_account_profile(cookies_list, timeout=10):
+    """用 cookies 请求抖音 web 端 profile_self 接口，识别真实账号信息。
+    返回 {"nickname", "unique_id", "short_id"} 或 None（网络失败/未登录）。"""
+    if not isinstance(cookies_list, list) or not cookies_list:
+        return None
+    key = None
+    try:
+        # 用 sessionid 前缀做缓存键，避免每次都请求
+        sid = next((c.get("value", "") for c in cookies_list
+                    if isinstance(c, dict) and c.get("name") == "sessionid"), "")
+        key = sid[:24] or "anon"
+        now = time.time()
+        hit = _profile_cache.get(key)
+        if hit and now - hit[0] < _PROFILE_TTL:
+            return hit[1]
+        import requests
+        cookie_dict = {c["name"]: c["value"] for c in cookies_list
+                       if isinstance(c, dict) and c.get("name") and c.get("value") is not None}
+        if "sessionid" not in cookie_dict:
+            return None
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": "https://www.douyin.com/",
+        }
+        url = ("https://www.douyin.com/aweme/v1/web/user/profile/self/"
+               "?device_platform=webapp&aid=6383&channel=channel_pc_web&version_code=170400")
+        resp = requests.get(url, cookies=cookie_dict, headers=headers, timeout=timeout)
+        data = resp.json()
+        u = data.get("user") if isinstance(data, dict) else None
+        if not u or not u.get("nickname"):
+            return None
+        profile = {
+            "nickname": str(u.get("nickname") or "").strip(),
+            "unique_id": str(u.get("unique_id") or "").strip(),
+            "short_id": str(u.get("short_id") or "").strip(),
+        }
+        _profile_cache[key] = (now, profile)
+        return profile
+    except Exception:
+        return None
 
 
 def _calc_achievements(stats):
@@ -552,7 +660,15 @@ def resolve_nickname_sync(unique_id, timeout=60):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        # 必须回收，否则被杀子进程会变僵尸（管道也未关闭）
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
         return {"ok": False, "msg": "查询超时（60秒），好友列表可能过长或网络较慢", "unique_id": unique_id}
 
     # 查询完成后读取最新昵称
@@ -768,6 +884,29 @@ class Handler(BaseHTTPRequestHandler):
     # 限制请求体大小
     max_request_body = MAX_REQUEST_BODY
 
+    def setup(self):
+        super().setup()
+        # 单连接 15s 读写超时：防 slowloris 式慢连接把线程长期占住
+        try:
+            self.connection.settimeout(15)
+        except OSError:
+            pass
+
+    def handle_one_request(self):
+        # 全局兜底：处理器里任何漏网异常都不让连接裸崩 / 抛出堆栈到 socket
+        try:
+            super().handle_one_request()
+        except (ConnectionError, socket.timeout) as e:
+            self.close_connection = True
+            print(f"[连接异常] {type(e).__name__}")
+        except Exception as e:
+            self.close_connection = True
+            traceback.print_exc()
+            try:
+                self._json({"ok": False, "msg": f"服务器内部错误：{type(e).__name__}"}, 500)
+            except Exception:
+                pass
+
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -801,6 +940,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
         elif path.endswith(".css"):
             self.send_header("Content-Type", "text/css; charset=utf-8")
+        elif path.endswith(".svg"):
+            self.send_header("Content-Type", "image/svg+xml")
+        elif path.endswith(".ico"):
+            self.send_header("Content-Type", "image/x-icon")
+        elif path.endswith(".json"):
+            self.send_header("Content-Type", "application/json; charset=utf-8")
         else:
             self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
@@ -819,12 +964,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.rfile.read(length)  # 消耗掉请求体
             except Exception:
                 pass
-            return {"_error": "请求体过大"}
+            return {"_error": "请求体过大", "_code": 413}
         try:
             raw = self.rfile.read(length)
-            return json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            return {"_error": "请求体不是合法的 JSON", "_code": 400}
+        # 所有 POST 接口均以 JSON 对象为契约；数组/数字/null 会让 body.get 直接崩
+        if not isinstance(data, dict):
+            return {"_error": "请求体必须是 JSON 对象", "_code": 400}
+        return data
 
     def do_OPTIONS(self):
         """处理 CORS 预检请求。"""
@@ -1064,9 +1213,15 @@ class Handler(BaseHTTPRequestHandler):
                         stats = json.load(f)
             except Exception:
                 stats = {}
+            if not isinstance(stats, dict):
+                stats = {}
             daily = stats.get("daily", {})
+            if not isinstance(daily, dict):
+                daily = {}
             today = time.strftime("%Y-%m-%d")
-            today_stats = daily.get(today, {"sent": 0, "success": 0, "failed": 0})
+            today_stats = daily.get(today)
+            if not isinstance(today_stats, dict):
+                today_stats = {"sent": 0, "success": 0, "failed": 0}
             # 计算本周数据
             import datetime
             now = datetime.datetime.now()
@@ -1074,6 +1229,8 @@ class Handler(BaseHTTPRequestHandler):
             week_sent = 0
             week_success = 0
             for date_str, d in daily.items():
+                if not isinstance(d, dict):
+                    continue
                 if date_str >= week_start:
                     week_sent += d.get("sent", 0)
                     week_success += d.get("success", 0)
@@ -1081,15 +1238,54 @@ class Handler(BaseHTTPRequestHandler):
             trend = []
             for i in range(6, -1, -1):
                 d = (now - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-                day_data = daily.get(d, {"sent": 0, "success": 0})
+                day_data = daily.get(d)
+                if not isinstance(day_data, dict):
+                    day_data = {"sent": 0, "success": 0}
                 trend.append({"date": d, "sent": day_data.get("sent", 0), "success": day_data.get("success", 0)})
             # 好友发送排行
             friend_stats = stats.get("friend_stats", {})
+            if not isinstance(friend_stats, dict):
+                friend_stats = {}
             friend_ranking = sorted(
-                [{"id": k, "name": v.get("name", k), "sent": v.get("sent", 0)} for k, v in friend_stats.items()],
+                [{"id": k, "name": v.get("name", k), "sent": v.get("sent", 0)}
+                 for k, v in friend_stats.items() if isinstance(v, dict)],
                 key=lambda x: x["sent"],
                 reverse=True,
             )[:10]
+            # 时段分布：聚合所有日期的 hours（24 小时桶）
+            hour_buckets = [0] * 24
+            dur_sum = 0.0
+            dur_cnt = 0
+            for d_data in daily.values():
+                if not isinstance(d_data, dict):
+                    continue
+                hours = d_data.get("hours", {}) or {}
+                for hh, cnt in hours.items():
+                    try:
+                        h = int(hh)
+                        if 0 <= h < 24:
+                            hour_buckets[h] += int(cnt)
+                    except (TypeError, ValueError):
+                        pass
+                dur_sum += float(d_data.get("dur_sum", 0) or 0)
+                dur_cnt += int(d_data.get("dur_cnt", 0) or 0)
+            hour_distribution = [{"hour": h, "sent": hour_buckets[h]} for h in range(24)]
+            # 平均耗时（秒）：单条处理 + 整次任务
+            avg_send_duration = round(dur_sum / dur_cnt, 1) if dur_cnt else None
+            run_dur_cnt = int(stats.get("run_dur_cnt", 0) or 0)
+            avg_run_duration = (round(float(stats.get("run_dur_sum", 0) or 0) / run_dur_cnt, 1)
+                                if run_dur_cnt else None)
+            # 模板维度使用统计（按使用次数降序）
+            _tpl = stats.get("template_stats", {})
+            if not isinstance(_tpl, dict):
+                _tpl = {}
+            template_stats = sorted(
+                [{"key": k, "name": v.get("name", k), "kind": v.get("kind", "preset"),
+                  "sent": v.get("sent", 0)}
+                 for k, v in _tpl.items() if isinstance(v, dict)],
+                key=lambda x: x["sent"],
+                reverse=True,
+            )
             # 成就系统（基于统计数据解锁）
             achievements, unlocked_count = _calc_achievements(stats)
             return self._json({
@@ -1099,6 +1295,10 @@ class Handler(BaseHTTPRequestHandler):
                 "total_runs": stats.get("total_runs", 0),
                 "trend": trend,
                 "friend_ranking": friend_ranking,
+                "hour_distribution": hour_distribution,
+                "template_stats": template_stats,
+                "avg_send_duration": avg_send_duration,
+                "avg_run_duration": avg_run_duration,
                 "achievements": achievements,
                 "unlocked_count": unlocked_count,
             })
@@ -1145,14 +1345,35 @@ class Handler(BaseHTTPRequestHandler):
 
         return self.send_error(404)
 
+    def _check_local_origin(self):
+        """本地控制台的 CSRF / DNS-rebinding 防护：
+        Host 必须是回环地址端口；浏览器同源 POST 带 Origin 时也必须来自回环。"""
+        host = (self.headers.get("Host") or "").lower()
+        if host and host not in ALLOWED_HOSTS:
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                hostname = (urlparse(origin).hostname or "").lower()
+            except Exception:
+                return False
+            if hostname not in ALLOWED_ORIGIN_HOSTS:
+                return False
+        return True
+
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._check_local_origin():
+            return self._json({"ok": False, "msg": "拒绝跨来源请求"}, 403)
+
         body = self._read_body()
 
-        # 检查请求体是否被拒绝
+        # 检查请求体是否被拒绝（过大 413 / 非法 JSON 400）
         if isinstance(body, dict) and body.get("_error"):
-            return self._json({"ok": False, "msg": body["_error"]}, 413)
+            return self._json({"ok": False, "msg": body["_error"]},
+                              int(body.get("_code") or 400))
 
         if path == "/api/config":
             # 保存简单配置项
@@ -1203,7 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
             if "tasks" in body:
                 tasks = body["tasks"]
                 if isinstance(tasks, list):
-                    write_tasks(tasks)
+                    write_tasks([t for t in tasks if isinstance(t, dict)])
             # [修复 D3] ball_position 之前被后端静默忽略，现在写入 .env 的 BALL_POSITION（JSON 格式）
             if "ball_position" in body:
                 bp = body["ball_position"]
@@ -1217,6 +1438,8 @@ class Handler(BaseHTTPRequestHandler):
             cookies = body.get("cookies") or ""
             if not uid:
                 return self._json({"ok": False, "msg": "缺少 unique_id"}, 400)
+            if not UID_RE.match(uid):
+                return self._json({"ok": False, "msg": "unique_id 仅允许字母/数字/._- 且不超过 64 位"}, 400)
             if not cookies.strip():
                 return self._json({"ok": False, "msg": "cookies 为空"}, 400)
             # 校验是否为合法 JSON（允许外层已有单引号）
@@ -1259,8 +1482,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/cookies/logout":
             """退出登录：删除指定账号的 Cookie"""
             uid = (body.get("unique_id") or "").strip()
-            if not uid:
-                return self._json({"ok": False, "msg": "缺少 unique_id"}, 400)
+            if not uid or not UID_RE.match(uid):
+                return self._json({"ok": False, "msg": "缺少或非法的 unique_id"}, 400)
             del_env_value(f"COOKIES_{uid.upper()}")
             return self._json({"ok": True, "account": uid})
 
@@ -1438,6 +1661,54 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"ok": False, "msg": f"检测失败: {str(e)}"}, 500)
 
+        if path == "/api/account/identify":
+            """用当前账号的 Cookies 识别真实抖音昵称/抖音号，并回写 TASKS。"""
+            env = parse_env()
+            tasks = read_tasks()
+            target = None
+            cookies_list = None
+            for t in tasks:
+                uid = (t.get("unique_id") or "").upper()
+                raw = env.get(f"COOKIES_{uid}", "")
+                if raw:
+                    try:
+                        arr = json.loads(raw)
+                    except Exception:
+                        arr = None
+                    if isinstance(arr, list) and arr:
+                        target = t
+                        cookies_list = arr
+                        break
+            if not target:
+                return self._json({"ok": False, "msg": "尚未配置 Cookie，无法识别账号"}, 400)
+            profile = fetch_account_profile(cookies_list)
+            if not profile:
+                return self._json({"ok": False,
+                                   "msg": "未能识别账号信息（Cookie 可能已失效或网络异常）"}, 502)
+            changed = False
+            if profile["nickname"] and target.get("username") != profile["nickname"]:
+                target["username"] = profile["nickname"]
+                changed = True
+            # unique_id 以接口返回为准（大小写纠正），但保留用户手动配置的原值兜底
+            new_uid = (profile.get("unique_id") or "").strip()
+            old_uid = target.get("unique_id") or ""
+            if new_uid and new_uid != old_uid and UID_RE.match(new_uid):
+                # 关键迁移：Cookie 存在旧 UID 键下，unique_id 变了必须把值搬到新键，
+                # 否则此后识别/监控全部找不到 Cookie（裸写：JSON 原样到行尾最稳妥）
+                old_key = f"COOKIES_{old_uid.upper()}"
+                new_key = f"COOKIES_{new_uid.upper()}"
+                old_val = env.get(old_key)
+                if old_val is not None:
+                    set_env_value(new_key, old_val)
+                    os.environ[new_key] = old_val
+                    del_env_value(old_key)
+                    os.environ.pop(old_key, None)
+                target["unique_id"] = new_uid
+                changed = True
+            if changed:
+                write_tasks(tasks)
+            return self._json({"ok": True, "profile": profile})
+
         if path == "/api/account/clear":
             """一键清除登录信息：删除所有 Cookie + 清空好友/昵称/备注/分组/生日/消息预设/日志
             保留账号身份（unique_id/username），连接自动断开。"""
@@ -1503,6 +1774,53 @@ class Handler(BaseHTTPRequestHandler):
                         pass
             return self._json({"ok": True, "cleared": cleared, "msg": f"已清空 {cleared} 个日志文件"})
 
+        if path == "/api/stats/reset":
+            """重置发送统计（不影响 sent_memory 去重记忆与 .env 配置）。
+            安全策略：重置前先把当前统计复制为带时间戳的备份，备份失败则中止重置，
+            绝不允许"备份没写成却把数据清了"。"""
+            stats_file = os.path.join(BASE_DIR, "data", "send_stats.json")
+            backup_file = os.path.join(
+                BASE_DIR, "data",
+                "send_stats.before_reset." + time.strftime("%Y%m%d_%H%M%S") + ".json")
+            tmp = stats_file + f".tmp.{os.getpid()}.{threading.get_ident()}"
+            # 与 core/tasks.py 的 record_send/record_run 共用 send_stats.json.lock
+            stats_lock_f = None
+            if fcntl is not None:
+                try:
+                    os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+                    stats_lock_f = open(stats_file + ".lock", "a+", encoding="utf-8")
+                    fcntl.flock(stats_lock_f.fileno(), fcntl.LOCK_EX)
+                except OSError:
+                    stats_lock_f = None
+            try:
+                os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+                if os.path.exists(stats_file):
+                    import shutil
+                    shutil.copy2(stats_file, backup_file)
+                    if not os.path.exists(backup_file):
+                        raise OSError("备份文件未生成，已中止重置")
+                fresh = {"daily": {}, "total_sent": 0, "total_runs": 0,
+                         "friend_stats": {}, "template_stats": {}}
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(fresh, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, stats_file)
+            except Exception as e:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                return self._json({"ok": False, "msg": f"重置失败（原数据未受影响）：{e}"}, 500)
+            finally:
+                if stats_lock_f is not None:
+                    try:
+                        fcntl.flock(stats_lock_f.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    stats_lock_f.close()
+            return self._json({"ok": True, "msg": "统计数据已重置",
+                               "backup": os.path.basename(backup_file)})
+
         if path == "/api/restart":
             target = body.get("target", "backend")
             if target == "frontend":
@@ -1558,8 +1876,8 @@ class Handler(BaseHTTPRequestHandler):
             """保存单个好友昵称 {unique_id, nickname}"""
             uid = (body.get("unique_id") or "").strip()
             nickname = (body.get("nickname") or "").strip()
-            if not uid:
-                return self._json({"ok": False, "msg": "缺少 unique_id"}, 400)
+            if not uid or not UID_RE.match(uid):
+                return self._json({"ok": False, "msg": "缺少或非法的 unique_id"}, 400)
             m = update_nickname(uid, nickname)
             return self._json({"ok": True, "nickname": m.get(uid), "friend_nicknames": m})
 
@@ -1567,6 +1885,8 @@ class Handler(BaseHTTPRequestHandler):
             """预览消息变量替换效果 {content, unique_id}"""
             content = (body.get("content") or "").strip()
             uid = (body.get("unique_id") or "").strip()
+            if uid and not UID_RE.match(uid):
+                return self._json({"ok": False, "msg": "非法的 unique_id"}, 400)
             try:
                 from core.msg_builder import preview_message
                 result = preview_message(content, uid or None)
@@ -1580,6 +1900,11 @@ class Handler(BaseHTTPRequestHandler):
             model = (body.get("model") or "").strip() or "MiniMax-M2.7"
             base_url = (body.get("base_url") or "").strip()
             provider = (body.get("provider") or "").strip()
+            # .env 是行格式，真实换行会截断/注入后续键；AI 配置没有任何理由含换行
+            for _name, _v in (("api_key", api_key), ("model", model),
+                              ("base_url", base_url), ("provider", provider)):
+                if "\n" in _v or "\r" in _v:
+                    return self._json({"ok": False, "msg": f"{_name} 含有非法换行符"}, 400)
             saved = []
             # 保存到 .env（原子写入），并同步到当前进程环境变量
             if "api_key" in body:
@@ -1698,16 +2023,16 @@ class Handler(BaseHTTPRequestHandler):
             """保存单个好友备注 {unique_id, remark}，remark 为空则删除"""
             uid = (body.get("unique_id") or "").strip()
             remark = (body.get("remark") or "").strip()
-            if not uid:
-                return self._json({"ok": False, "msg": "缺少 unique_id"}, 400)
+            if not uid or not UID_RE.match(uid):
+                return self._json({"ok": False, "msg": "缺少或非法的 unique_id"}, 400)
             m = update_remark(uid, remark)
             return self._json({"ok": True, "remark": m.get(uid, ""), "friend_remarks": m})
 
         if path == "/api/friend/resolve":
             """实时查询抖音号昵称（启动浏览器子进程），超时 60 秒"""
             uid = (body.get("unique_id") or "").strip()
-            if not uid:
-                return self._json({"ok": False, "msg": "缺少 unique_id"}, 400)
+            if not uid or not UID_RE.match(uid):
+                return self._json({"ok": False, "msg": "缺少或非法的 unique_id"}, 400)
             # 如果已有昵称，直接返回
             existing = read_nicknames().get(uid)
             if existing and not body.get("force"):
@@ -1724,14 +2049,15 @@ class Handler(BaseHTTPRequestHandler):
             imported = []
             try:
                 if "tasks" in data and isinstance(data["tasks"], list):
+                    clean_tasks = [t for t in data["tasks"] if isinstance(t, dict)]
                     if mode == "replace":
-                        write_tasks(data["tasks"])
+                        write_tasks(clean_tasks)
                     else:
                         # 合并：保留已有账号，追加新账号（按 unique_id 去重）
                         existing = read_tasks()
                         existing_ids = {t.get("unique_id") for t in existing if t.get("unique_id")}
-                        for t in data["tasks"]:
-                            if isinstance(t, dict) and t.get("unique_id") and t["unique_id"] not in existing_ids:
+                        for t in clean_tasks:
+                            if t.get("unique_id") and t["unique_id"] not in existing_ids:
                                 existing.append(t)
                                 existing_ids.add(t["unique_id"])
                         write_tasks(existing)
@@ -1796,12 +2122,17 @@ class Handler(BaseHTTPRequestHandler):
             """触发火花状态刷新（异步执行）"""
             global _spark_monitor_progress
 
+            # 超时自动重置：如果 running 超过 5 分钟，视为线程挂死，自动清除
             if _spark_monitor_progress.get("running"):
-                return self._json({
-                    "ok": False,
-                    "msg": "火花监控正在运行中，请稍候...",
-                    "progress": _spark_monitor_progress,
-                }, 409)
+                started = _spark_monitor_progress.get("start_time")
+                if started and (time.time() - started > 300):
+                    _spark_monitor_progress = {"running": False, "current": 0, "total": 0, "message": "已超时重置", "result": None}
+                else:
+                    return self._json({
+                        "ok": False,
+                        "msg": "火花监控正在运行中，请稍候...",
+                        "progress": _spark_monitor_progress,
+                    }, 409)
 
             # 获取当前登录账号的 Cookie 和好友列表
             env = parse_env()
@@ -1837,6 +2168,7 @@ class Handler(BaseHTTPRequestHandler):
                 "total": 0,
                 "message": "正在启动火花监控...",
                 "result": None,
+                "start_time": time.time(),
             }
 
             # 进度回调函数
@@ -1872,6 +2204,11 @@ class Handler(BaseHTTPRequestHandler):
                 "progress": _spark_monitor_progress,
             })
 
+        # 火花监控强制重置 API（线程卡死时手动恢复）
+        if path == "/api/spark/reset":
+            _spark_monitor_progress = {"running": False, "current": 0, "total": 0, "message": "已手动重置", "result": None}
+            return self._json({"ok": True, "msg": "火花监控状态已重置"})
+
         return self.send_error(404)
 
     def log_message(self, fmt, *args):
@@ -1890,9 +2227,11 @@ def main():
     srv.daemon_threads = True  # 守护线程，确保退出时不挂起
 
     # 注册信号处理：Ctrl+C 优雅退出
+    # 注意：信号在主线程执行，而 serve_forever 也占着主线程，
+    # 在处理器里直接调 srv.shutdown() 会自己等自己 → 死锁，必须丢到独立线程。
     def _shutdown(signum, frame):
         print("\n正在关闭服务器...")
-        srv.shutdown()
+        threading.Thread(target=srv.shutdown, daemon=True).start()
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 

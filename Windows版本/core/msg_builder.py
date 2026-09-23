@@ -11,9 +11,27 @@ core/msg_builder.py
 import random
 import os
 import json
+import hashlib
 from datetime import datetime
 from utils.config import get_config
 from utils.hitokoto import request_hitokoto
+
+
+def _template_meta(kind: str, content: str = "", scenario: str = "") -> dict:
+    """构造模板维度统计元数据：{key, name, kind}。
+    key 稳定（预设按内容哈希），编辑过的文案视为新模板。"""
+    if kind == "ai":
+        label = {"birthday": "AI·生日祝福", "festival": "AI·节日问候",
+                 "spark": "AI·个性化"}.get(scenario, "AI 生成")
+        # key 按场景区分：之前所有 AI 场景共用 "__ai__"，互相覆盖计数/名称来回跳
+        return {"key": "ai:" + (scenario or "custom"), "name": label, "kind": "ai"}
+    if kind == "legacy":
+        return {"key": "__legacy__", "name": "旧版单模板", "kind": "legacy"}
+    # preset
+    raw = (content or "").strip().replace("\n", " ")
+    name = raw[:14] + ("…" if len(raw) > 14 else "") if raw else "空预设"
+    key = "p:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return {"key": key, "name": name, "kind": "preset"}
 
 
 def build_message_with_openai() -> str:
@@ -383,20 +401,14 @@ def _load_friend_info(unique_id: str) -> dict:
         return {"unique_id": unique_id, "nickname": "", "remark": ""}
 
 
-def build_message(friend_unique_id: str = None) -> str:
-    """
-    根据发送模式构建消息：
-      - 有文字预设（messagePresets）且非空 → 优先用预设（纯文案，不含前后缀）
-      - sendMode=random → 每次随机挑一条
-      - sendMode=fixed → 用 selectedPresetIndex 指定的那条
-      - 无预设 → 回退到旧 messageTemplate
-      - 变量替换：{昵称} {备注} {抖音号} {星期} {日期} {时间} {时段} {问候}
-      - [API] 替换为一言
-      - 最终统一拼接：[续火花吧] + 时段问候语 + 文案 + 换行 + 【来自<用户名>的自动续火花脚本】
-    """
+def build_message_ex(friend_unique_id: str = None):
+    """构建消息并同时返回模板维度元数据。
+    返回 (message:str, meta:dict)；meta={key,name,kind} 用于统计。
+    构建规则同 build_message。"""
     config = get_config()
     presets = config.get("messagePresets") or []
 
+    meta = None
     if presets:
         send_mode = config.get("sendMode", "random")
         if send_mode == "fixed":
@@ -407,9 +419,11 @@ def build_message(friend_unique_id: str = None) -> str:
             content = presets[idx]
         else:
             content = random.choice(presets)
+        meta = _template_meta("preset", content)
     else:
         # 回退：旧模板
         content = config.get("messageTemplate", "续火花")
+        meta = _template_meta("legacy")
 
     # 加载好友信息（用于变量替换）
     friend_info = _load_friend_info(friend_unique_id) if friend_unique_id else None
@@ -427,6 +441,7 @@ def build_message(friend_unique_id: str = None) -> str:
             ai_key = ""
 
     ai_content = None
+    ai_scenario = ""
     # 生日祝福优先（开启 F_BIRTHDAY 且该好友生日是今天）
     if _feat_flag("F_BIRTHDAY") and _today_is_birthday(friend_unique_id) and ai_key:
         try:
@@ -435,6 +450,7 @@ def build_message(friend_unique_id: str = None) -> str:
             else:
                 ai_content = generate_ai_message(scenario="birthday")
             ai_content = ai_content.strip()[:60]
+            ai_scenario = "birthday"
         except Exception:
             ai_content = None
     elif festival and ai_festival and ai_key:
@@ -445,6 +461,7 @@ def build_message(friend_unique_id: str = None) -> str:
             else:
                 ai_content = generate_ai_message(scenario="festival")
             ai_content = ai_content.strip()[:60]
+            ai_scenario = "festival"
         except Exception:
             ai_content = None
     elif ai_personal and ai_key:
@@ -452,12 +469,14 @@ def build_message(friend_unique_id: str = None) -> str:
         try:
             ai_content = generate_personal_message(friend_info, scenario="spark")
             ai_content = ai_content.strip()[:60]
+            ai_scenario = "spark"
         except Exception:
             ai_content = None
     if ai_content:
         greeting = _get_greeting()
         sender_name = config.get("account", {}).get("username") or os.getenv("DOUYIN_USERNAME", "我")
-        return f"[续火花吧]{greeting}{ai_content}\n【来自{sender_name}的自动续火花脚本】"
+        return (f"[续火花吧]{greeting}{ai_content}\n【来自{sender_name}的自动续火花脚本】",
+                _template_meta("ai", scenario=ai_scenario))
 
     # 变量替换
     content = _resolve_variables(content, friend_info)
@@ -465,7 +484,16 @@ def build_message(friend_unique_id: str = None) -> str:
     content = _resolve_api(content).strip()
     greeting = _get_greeting()
     sender_name = config.get("account", {}).get("username") or os.getenv("DOUYIN_USERNAME", "我")
-    return f"[续火花吧]{greeting}{content}\n【来自{sender_name}的自动续火花脚本】"
+    return f"[续火花吧]{greeting}{content}\n【来自{sender_name}的自动续火花脚本】", meta
+
+
+def build_message(friend_unique_id: str = None) -> str:
+    """兼容包装：只返回消息文本（规则详见 build_message_ex）。"""
+    try:
+        return build_message_ex(friend_unique_id)[0]
+    except Exception:
+        # 极端情况下保底，保证发送链路不被统计改造影响
+        return "[续火花吧]续火花\n【来自自动续火花脚本】"
 
 
 def preview_message(content: str, friend_unique_id: str = None) -> str:

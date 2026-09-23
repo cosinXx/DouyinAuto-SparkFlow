@@ -1,3 +1,5 @@
+import contextlib
+import threading
 import traceback
 import os
 import re
@@ -5,12 +7,18 @@ import subprocess
 import sys
 from utils.logger import setup_logger
 from utils.config import get_config, get_userData
-from core.msg_builder import build_message, build_message_with_openai
+from core.msg_builder import build_message, build_message_ex, build_message_with_openai
 from core.browser import get_browser
 from playwright.sync_api import Response
 import time
 import json
 import random
+
+# fcntl 仅 POSIX；Windows 无此模块时降级为无跨进程锁（文件原子替换仍安全）
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
 
 
 config = get_config()
@@ -36,8 +44,16 @@ def _flush_nicknames_to_env():
     if _nickname_cache_lock or not _nickname_cache:
         return
     _nickname_cache_lock = True
+    lock_f = None
     try:
         env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        # 跨进程文件锁：与 webui/server.py 共用同一个 .env.lock（flock 随进程自动释放）
+        if fcntl is not None:
+            try:
+                lock_f = open(env_path + ".lock", "a+", encoding="utf-8")
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                lock_f = None
         # [修复] 一次性读取所有行，后续解析和写回都基于这同一份 lines
         try:
             with open(env_path, encoding="utf-8") as f:
@@ -71,31 +87,47 @@ def _flush_nicknames_to_env():
             return
 
         # 基于同一份 lines 做行级替换
+        # 裸写（不加单引号）：昵称 JSON 里可能含撇号（如 O'Brien），单引号包裹会提前闭合；
+        # dotenv 对裸值原样保留到行尾，JSON 本身不含真实换行，安全。
         new_lines = []
         found = False
         value = json.dumps(existing, ensure_ascii=False)
         for line in lines:
             if line.strip().startswith("FRIEND_NICKNAMES="):
-                new_lines.append(f"FRIEND_NICKNAMES='{value}'")
+                new_lines.append(f"FRIEND_NICKNAMES={value}")
                 found = True
             else:
                 new_lines.append(line)
         if not found:
-            new_lines.append(f"FRIEND_NICKNAMES='{value}'")
+            new_lines.append(f"FRIEND_NICKNAMES={value}")
 
-        # 原子写入
-        tmp_path = env_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(new_lines) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, env_path)
+        # 原子写入（临时名带 pid，避免与 server.py 的临时文件撞名）
+        tmp_path = env_path + f".tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(new_lines) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, env_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
         logger.debug(f"已将 {len(_nickname_cache)} 个昵称写入 .env")
         _nickname_cache.clear()
     except Exception as e:
         logger.warning(f"写入昵称映射失败: {e}")
     finally:
         _nickname_cache_lock = False
+        if lock_f is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_f.close()
 
 
 def send_desktop_notification(title: str, message: str, sound: bool = True):
@@ -123,6 +155,33 @@ def send_desktop_notification(title: str, message: str, sound: bool = True):
 # 发送统计
 # ============================================================
 STATS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "send_stats.json")
+# 统计文件的跨进程锁（与 webui/server.py 的统计重置共用），防止 load→改→写 竞态丢数据
+STATS_LOCK_PATH = STATS_FILE + ".lock"
+_stats_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _stats_file_lock():
+    """线程锁 + flock 双重保护；Windows 无 fcntl 时仅线程锁。"""
+    lock_f = None
+    with _stats_lock:
+        if fcntl is not None:
+            try:
+                _ensure_stats_dir()
+                lock_f = open(STATS_LOCK_PATH, "a+", encoding="utf-8")
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                lock_f = None
+        try:
+            yield
+        finally:
+            if lock_f is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock_f.close()
 
 
 def _ensure_stats_dir():
@@ -142,16 +201,28 @@ def _load_stats() -> dict:
     return {"daily": {}, "total_sent": 0, "total_runs": 0, "friend_stats": {}}
 
 
+def _default_day():
+    return {"sent": 0, "success": 0, "failed": 0,
+            "hours": {}, "dur_sum": 0.0, "dur_cnt": 0}
+
+
 def _save_stats(stats: dict):
-    """保存统计数据"""
+    """保存统计数据（调用方需持有 _stats_file_lock）。临时文件带 pid 防多进程撞名。"""
+    tmp_path = STATS_FILE + f".tmp.{os.getpid()}"
     try:
         _ensure_stats_dir()
-        tmp_path = STATS_FILE + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, STATS_FILE)
     except Exception as e:
         logger.debug(f"保存统计数据失败: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 # ============================================================
@@ -208,16 +279,20 @@ def _load_memory() -> dict:
 
 
 def _save_memory(m: dict):
+    tmp_path = MEMORY_FILE + f".tmp.{os.getpid()}"
     try:
         _ensure_stats_dir()
-        tmp_path = MEMORY_FILE + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(m, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, MEMORY_FILE)
     except Exception:
-        pass
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def is_duplicate(friend_key: str, content: str) -> bool:
@@ -242,39 +317,97 @@ def remember_sent(friend_key: str, content: str):
         pass
 
 
-def record_send(friend_id: str, friend_name: str = "", success: bool = True):
-    """记录一次发送统计"""
+def record_send(friend_id: str, friend_name: str = "", success: bool = True,
+                duration: float = None, template: dict = None):
+    """记录一次发送统计（load→改→save 全程持统计文件锁，防与 server 重置竞态）。
+
+    新增维度（向后兼容旧 json，缺字段自动补）：
+      · daily[today].hours：按小时聚合的发送次数 {"HH": n}
+      · daily[today].dur_sum/dur_cnt：单条处理耗时（秒），用于平均耗时
+      · template_stats：模板维度 {key: {sent, name, kind}}
+    """
+    with _stats_file_lock():
+        _record_send_locked(friend_id, friend_name, success, duration, template)
+
+
+def _record_send_locked(friend_id, friend_name="", success=True, duration=None, template=None):
     try:
         stats = _load_stats()
+        stats.setdefault("daily", {})
+        stats.setdefault("friend_stats", {})
+        stats.setdefault("template_stats", {})
+        stats.setdefault("total_sent", 0)
         today = time.strftime("%Y-%m-%d")
-        # 每日统计
-        if today not in stats["daily"]:
-            stats["daily"][today] = {"sent": 0, "success": 0, "failed": 0}
-        stats["daily"][today]["sent"] += 1
+        # 每日统计（兼容旧结构：补齐新增键）
+        day = stats["daily"].get(today)
+        if not isinstance(day, dict):
+            day = {}
+        day.setdefault("sent", 0)
+        day.setdefault("success", 0)
+        day.setdefault("failed", 0)
+        day.setdefault("hours", {})
+        day.setdefault("dur_sum", 0.0)
+        day.setdefault("dur_cnt", 0)
+        day["sent"] += 1
         if success:
-            stats["daily"][today]["success"] += 1
+            day["success"] += 1
         else:
-            stats["daily"][today]["failed"] += 1
+            day["failed"] += 1
+        # 时段分布（按本地小时）
+        hh = str(time.localtime().tm_hour)
+        day["hours"][hh] = day["hours"].get(hh, 0) + 1
+        # 单条处理耗时
+        if duration is not None:
+            try:
+                d = max(0.0, float(duration))
+                day["dur_sum"] = round(day["dur_sum"] + d, 3)
+                day["dur_cnt"] += 1
+            except (TypeError, ValueError):
+                pass
+        stats["daily"][today] = day
         # 总计
         if success:
             stats["total_sent"] += 1
         # 好友统计
         if friend_id:
-            if friend_id not in stats["friend_stats"]:
+            if friend_id not in stats["friend_stats"] or not isinstance(stats["friend_stats"][friend_id], dict):
                 stats["friend_stats"][friend_id] = {"sent": 0, "name": friend_name}
             stats["friend_stats"][friend_id]["sent"] += 1
             if friend_name:
                 stats["friend_stats"][friend_id]["name"] = friend_name
+        # 模板维度统计
+        if template and template.get("key"):
+            tk = stats["template_stats"].get(template["key"])
+            if not isinstance(tk, dict):
+                tk = {"sent": 0, "name": template.get("name", ""),
+                      "kind": template.get("kind", "preset")}
+            tk["sent"] += 1
+            if template.get("name"):
+                tk["name"] = template["name"]
+            tk["kind"] = template.get("kind", tk.get("kind", "preset"))
+            stats["template_stats"][template["key"]] = tk
         _save_stats(stats)
     except Exception as e:
         logger.debug(f"记录发送统计失败: {e}")
 
 
-def record_run(success: bool = True):
-    """记录一次任务运行"""
+def record_run(success: bool = True, duration: float = None):
+    """记录一次任务运行（含可选运行耗时秒数，累加到 run_dur_sum/run_dur_cnt）。持统计锁。"""
+    with _stats_file_lock():
+        _record_run_locked(success, duration)
+
+
+def _record_run_locked(success=True, duration=None):
     try:
         stats = _load_stats()
-        stats["total_runs"] += 1
+        stats["total_runs"] = stats.get("total_runs", 0) + 1
+        if duration is not None:
+            try:
+                d = max(0.0, float(duration))
+                stats["run_dur_sum"] = round(stats.get("run_dur_sum", 0.0) + d, 3)
+                stats["run_dur_cnt"] = stats.get("run_dur_cnt", 0) + 1
+            except (TypeError, ValueError):
+                pass
         _save_stats(stats)
     except Exception:
         pass
@@ -584,6 +717,7 @@ def do_user_task(browser, username, cookies, targets):
                 break
 
             # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
+            t_friend_start = time.time()
             chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
             page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
             chat_input = page.locator(chat_input_selector)
@@ -600,7 +734,7 @@ def do_user_task(browser, username, cookies, targets):
                 # nickname 模式下，targetName 就是 targets 中的值
                 if targetName in targets:
                     friend_unique_id = targetName
-            message = build_message(friend_unique_id)
+            message, tpl_meta = build_message_ex(friend_unique_id)
             # v27 消息去重：与历史重复时自动加个小尾巴，避免一模一样（同时保证不漏发）
             if _feat_flag("AI_DEDUP") and is_duplicate(friend_unique_id or targetName, message):
                 marker = random.choice([" ✨", " ^_^", " 🌟", " 💬", " 👋"])
@@ -614,15 +748,18 @@ def do_user_task(browser, username, cookies, targets):
             )
             # 发送消息（含失败自动重试，最多重试 2 次）
             ok = _send_message_with_retry(page, chat_input, lines, username, targetName)
+            elapsed = round(time.time() - t_friend_start, 2)
             if ok:
                 sent_count += 1
                 if not DRYRUN:
-                    record_send(friend_unique_id or targetName, targetName, success=True)
+                    record_send(friend_unique_id or targetName, targetName,
+                                success=True, duration=elapsed, template=tpl_meta)
                     remember_sent(friend_unique_id or targetName, message)
-                logger.info(f"账号 {username} 给好友 {targetName} 发送消息完成")
+                logger.info(f"账号 {username} 给好友 {targetName} 发送消息完成（耗时 {elapsed:.1f}s）")
             else:
                 if not DRYRUN:
-                    record_send(friend_unique_id or targetName, targetName, success=False)
+                    record_send(friend_unique_id or targetName, targetName,
+                                success=False, duration=elapsed, template=tpl_meta)
                 logger.warning(f"账号 {username} 给好友 {targetName} 重试后仍未确认发送成功，跳过")
             # v27 限流保护：随机延迟 + 基础等待，模拟真人节奏
             rate_limit_sleep()
@@ -634,6 +771,7 @@ def do_user_task(browser, username, cookies, targets):
 
 def runTasks():
     playwright, browser = get_browser()
+    t_run_start = time.time()
     try:
         # 检查是否启用多任务和任务数量
         # 创建信号量以限制并发任务数量
@@ -663,7 +801,10 @@ def runTasks():
                 fail_count += 1
     finally:
         # [修复] 记录本次任务运行次数（之前从未调用，导致 total_runs 永远为 0，成就系统失效）
-        record_run(success=(fail_count == 0))
+        # [v32.1] 测试运行（DRYRUN）不计入真实统计，否则试跑会刷运行次数/解锁成就
+        if not DRYRUN:
+            record_run(success=(fail_count == 0),
+                       duration=round(time.time() - t_run_start, 2))
         # 任务结束时将收集到的昵称写入 .env
         _flush_nicknames_to_env()
         # 发送桌面通知
